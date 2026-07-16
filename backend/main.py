@@ -7,14 +7,23 @@ from pydantic import BaseModel
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from dotenv import load_dotenv
 
 load_dotenv()
 google_api_key = os.getenv("GEMINI_API_KEY")
 
-rag_chain = None
+conversational_rag_chain = None
+
+chat_histories = {}
+
+def get_session_history(session_id: str):
+    if session_id not in chat_histories:
+        chat_histories[session_id] = InMemoryChatMessageHistory()
+    return chat_histories[session_id]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -55,6 +64,7 @@ async def lifespan(app: FastAPI):
             "If it IS about food, judge their sad ingredient list, mention what cuisine they are failing to imitate based on the context, "
             "and invent a pathetic recipe name."
         )),
+        MessagesPlaceholder(variable_name="chat_history"),
         ("user", "Here is my input: {ingredients}")
     ])
 
@@ -70,6 +80,13 @@ async def lifespan(app: FastAPI):
         | llm
         | StrOutputParser()
     )
+    conversational_rag_chain = RunnableWithMessageHistory(
+        rag_chain,
+        get_session_history,
+        input_messages_key="ingredients",
+        history_messages_key="chat_history"
+    )
+    
     print("FAISS database loaded instantly and RAG Chain assembled successfully!")
     yield
 
@@ -83,16 +100,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class IngredientRequest(BaseModel):
+class ChatRequest(BaseModel):
     ingredients: str
-
+    session_id: str
+    
 @app.post("/roast")
-async def roast_ingredients(payload: IngredientRequest):
-    if not rag_chain:
+async def roast_ingredients(payload: ChatRequest):
+    if not conversational_rag_chain:
         raise HTTPException(status_code=503, detail="Server is still initializing the database.")
     
     try:
-        response_text = rag_chain.invoke({"ingredients": payload.ingredients})
+        response_text = conversational_rag_chain.invoke(
+            {"ingredients": payload.ingredients},
+            config={"configurable": {"session_id": payload.session_id}}
+        )
         return {"roast": response_text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
